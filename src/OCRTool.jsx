@@ -135,6 +135,50 @@ async function runOCROnImage(objectUrl, lang, onProgress) {
   }
 }
 
+// ─── PDF.js loader & page extractor ──────────────────────────────────────────
+async function loadPdfJS() {
+  if (window.pdfjsLib) return window.pdfjsLib;
+  return new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js";
+    s.onload = () => {
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js";
+      resolve(window.pdfjsLib);
+    };
+    s.onerror = () => reject(new Error("Failed to load PDF.js engine"));
+    document.head.appendChild(s);
+  });
+}
+
+async function extractImagesFromPdf(pdfFile) {
+  const pdfjsLib = await loadPdfJS();
+  const arrayBuffer = await pdfFile.arrayBuffer();
+  const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+  const pdf = await loadingTask.promise;
+  const numPages = pdf.numPages;
+  const images = [];
+
+  for (let i = 1; i <= numPages; i++) {
+    const page = await pdf.getPage(i);
+    // Render page to canvas at 2.2x scale for higher resolution text recognition
+    const viewport = page.getViewport({ scale: 2.2 });
+    const canvas = document.createElement("canvas");
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    const ctx = canvas.getContext("2d");
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+    const objectUrl = URL.createObjectURL(blob);
+    images.push({
+      name: `${pdfFile.name.replace(/\.[^.]+$/, "")}_page_${i}.png`,
+      objectUrl,
+      mime: "image/png",
+    });
+  }
+  return images;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 //  OCRTool Component
 // ════════════════════════════════════════════════════════════════════════════
@@ -171,21 +215,36 @@ export default function OCRTool({ onBack }) {
 
   const processFile = useCallback(async (file) => {
     if (!file) return;
-    if (!file.name.toLowerCase().endsWith(".zip")) {
-      setErrorMsg("Please upload a .zip file containing images.");
+    const nameLower = file.name.toLowerCase();
+    const isZip   = nameLower.endsWith(".zip");
+    const isPdf   = nameLower.endsWith(".pdf");
+    const isImage = ["jpg", "jpeg", "png", "webp", "gif", "bmp"].some(ext => nameLower.endsWith("." + ext));
+
+    if (!isZip && !isPdf && !isImage) {
+      setErrorMsg("Please upload a ZIP archive, PDF document, or standard image file.");
       setStatus("error"); return;
     }
+
     setStatus("loading"); setResults([]); setErrorMsg("");
     setProgress({ current: 0, total: 0, imgPct: 0 });
 
     try {
       await loadTesseract();
-      const images = await extractImagesFromZip(file);
+      let images = [];
+
+      if (isZip) {
+        images = await extractImagesFromZip(file);
+      } else if (isPdf) {
+        images = await extractImagesFromPdf(file);
+      } else if (isImage) {
+        images = [{ name: file.name, objectUrl: URL.createObjectURL(file), mime: file.type }];
+      }
+
       objectUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
       objectUrlsRef.current = images.map((i) => i.objectUrl);
 
       if (images.length === 0) {
-        setErrorMsg("No images found in ZIP. Supported: JPG, PNG, WebP, BMP, GIF.");
+        setErrorMsg("No images or pages found to process.");
         setStatus("error"); return;
       }
       setProgress({ current: 0, total: images.length, imgPct: 0 });
@@ -206,7 +265,7 @@ export default function OCRTool({ onBack }) {
       }
       setStatus("done");
     } catch (e) {
-      setErrorMsg(e.message || "Failed to process ZIP file.");
+      setErrorMsg(e.message || "Failed to process the uploaded file.");
       setStatus("error");
     }
   }, [lang]);
@@ -298,16 +357,16 @@ export default function OCRTool({ onBack }) {
               onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}
             >
               <div style={S.dropEmoji}>📦</div>
-              <div style={S.dropTitle}>Drag &amp; drop your ZIP file here</div>
-              <div style={S.dropSub}>ZIP file containing JPG, PNG, WebP, BMP images</div>
-              <div style={S.dropSub2}>Each image is enhanced before OCR for better accuracy</div>
+              <div style={S.dropTitle}>Drag &amp; drop your ZIP, PDF, or image file here</div>
+              <div style={S.dropSub}>Supports ZIP archives, PDF documents, or standard images (JPG, PNG, WebP, BMP, GIF)</div>
+              <div style={S.dropSub2}>Each image is enhanced before OCR for maximum accuracy</div>
             </div>
             <div style={S.orRow}>
               <span style={S.orLine} /><span style={S.orText}>or</span><span style={S.orLine} />
             </div>
             <label>
-              <input ref={fileInputRef} type="file" accept=".zip,application/zip" style={{ display: "none" }} onChange={onInputChange} />
-              <span style={S.fileBtn}>📂 Browse ZIP File</span>
+              <input ref={fileInputRef} type="file" accept=".zip,application/zip,.pdf,application/pdf,image/*" style={{ display: "none" }} onChange={onInputChange} />
+              <span style={S.fileBtn}>📂 Select File</span>
             </label>
             {status === "error" && <div style={S.errorBox}>⚠️ {errorMsg}</div>}
           </div>
