@@ -42,7 +42,7 @@ function TiltCard({ children, style, glowColor = "rgba(255,107,53,0.3)" }) {
 }
 
 // ─── QR Popup Modal ──────────────────────────────────────────────────────────
-function QRModal({ onClose }) {
+export function QRModal({ onClose }) {
   useEffect(() => {
     document.body.style.overflow = "hidden";
     return () => { document.body.style.overflow = ""; };

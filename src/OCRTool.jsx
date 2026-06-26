@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import JSZip from "jszip";
+import { QRModal } from "./LandingPage";
 
 // ─── Language options ────────────────────────────────────────────────────────
 const LANG_OPTIONS = [
@@ -8,7 +9,6 @@ const LANG_OPTIONS = [
   { value: "mar+eng",     label: "मराठी + English" },
   { value: "mar+hin+eng", label: "मराठी + हिंदी + English" },
   { value: "hin",         label: "हिंदी (Hindi)" },
-  { value: "eng",         label: "English only" },
 ];
 
 // ─── Tesseract CDN loader ────────────────────────────────────────────────────
@@ -146,8 +146,17 @@ export default function OCRTool({ onBack }) {
   const [progress,     setProgress]     = useState({ current: 0, total: 0, imgPct: 0 });
   const [errorMsg,     setErrorMsg]     = useState("");
   const [tesseractReady, setTesseractReady] = useState(false);
+  const [showCoffeeModal, setShowCoffeeModal] = useState(false);
+  const [selectedResultIndex, setSelectedResultIndex] = useState(0);
   const fileInputRef   = useRef(null);
   const objectUrlsRef  = useRef([]);
+
+  useEffect(() => {
+    if (status === "done") {
+      setShowCoffeeModal(true);
+      setSelectedResultIndex(0);
+    }
+  }, [status]);
 
   useEffect(() => {
     document.title = "Marathi OCR Tool — Extract Text from Images";
@@ -311,21 +320,32 @@ export default function OCRTool({ onBack }) {
               <span style={S.progressLabel}>Processing image {progress.current} of {progress.total}…</span>
               <span style={S.progressPct}>{Math.min(overallPct, 99)}%</span>
             </div>
-            <div style={S.bar}><div style={{ ...S.barFill, width: `${Math.min(overallPct, 99)}%` }} /></div>
+            <div style={S.bar}>
+              <div style={{ ...S.barFill, width: `${Math.min(overallPct, 99)}%` }} />
+            </div>
             <div style={S.progressSub}>
               ✨ Enhanced mode: upscale → grayscale → contrast → sharpen → OCR &nbsp;·&nbsp;
               {LANG_OPTIONS.find((o) => o.value === lang)?.label}
             </div>
-            <div style={{ marginTop: 20 }}>
+            
+            {/* Progress Card Grid (8 per row on desktop) */}
+            <div style={S.progressGrid}>
               {results.map((r) => (
-                <div key={r.name} style={S.miniCard}>
-                  <span>{r.status === "done" ? "✅" : r.status === "error" ? "❌" : "⏳"}</span>
-                  <span style={S.miniName}>{r.name}</span>
+                <div
+                  key={r.name}
+                  style={{
+                    ...S.miniCardGrid,
+                    ...(r.status === "processing" ? S.miniCardProcessing : r.status === "done" ? S.miniCardDone : {})
+                  }}
+                >
+                  <div style={S.miniCardIcon}>
+                    {r.status === "done" ? "✅" : r.status === "error" ? "❌" : "⏳"}
+                  </div>
+                  <div style={S.miniCardName} title={r.name}>{r.name}</div>
                   {r.status === "processing" && (
-                    <>
-                      <div style={S.miniBarWrap}><div style={{ ...S.miniBar, width: `${r.pct}%` }} /></div>
-                      <span style={S.miniPct}>{r.pct === 0 ? "Enhancing…" : `${r.pct}%`}</span>
-                    </>
+                    <div style={S.miniCardPct}>
+                      {r.pct === 0 ? "Enhancing…" : `${r.pct}%`}
+                    </div>
                   )}
                 </div>
               ))}
@@ -347,17 +367,79 @@ export default function OCRTool({ onBack }) {
                 <button style={S.btnGhost}   onClick={reset}>↺ New Upload</button>
               </div>
             </div>
-            {results.map((r) => (
-              <div key={r.name} style={S.card}>
-                <div style={S.cardHead}>
-                  <span>{r.status === "done" ? "✅" : "❌"}</span>
-                  <code style={S.cardName}>{r.name}</code>
+
+            {/* Results Grid (8 per row on desktop) */}
+            <div style={S.resultsGrid}>
+              {results.map((r, idx) => (
+                <button
+                  key={r.name}
+                  style={{
+                    ...S.resultCard,
+                    ...(selectedResultIndex === idx ? S.resultCardActive : {}),
+                    ...(r.status === "error" ? S.resultCardError : {})
+                  }}
+                  onClick={() => setSelectedResultIndex(idx)}
+                >
+                  <div style={S.rcIcon}>
+                    {r.status === "done" ? "📄" : "❌"}
+                  </div>
+                  <div style={S.rcName} title={r.name}>{r.name}</div>
+                  <div style={S.rcStatus}>
+                    {r.status === "done" ? "Success" : "Failed"}
+                  </div>
+                </button>
+              ))}
+            </div>
+
+            {/* Interactive Selected Result Text Preview & Editor */}
+            {results.length > 0 && results[selectedResultIndex] && (
+              <div style={S.previewBox}>
+                <div style={S.previewHeader}>
+                  <div style={S.previewTitle}>
+                    <span style={{ marginRight: 8 }}>📄</span>
+                    <code>{results[selectedResultIndex].name}</code>
+                  </div>
+                  <div style={S.previewActions}>
+                    <button
+                      style={S.previewBtn}
+                      onClick={() => {
+                        const txt = results[selectedResultIndex].text;
+                        navigator.clipboard.writeText(txt);
+                        alert("Copied to clipboard!");
+                      }}
+                    >
+                      📋 Copy Text
+                    </button>
+                    <button
+                      style={S.previewBtn}
+                      onClick={() => {
+                        const r = results[selectedResultIndex];
+                        const blob = new Blob(["\uFEFF" + r.text], { type: "text/plain;charset=utf-8" });
+                        const url  = URL.createObjectURL(blob);
+                        const a    = document.createElement("a"); a.href = url;
+                        a.download = r.name.replace(/\.[^.]+$/, "") + "_ocr.txt"; a.click();
+                        URL.revokeObjectURL(url);
+                      }}
+                    >
+                      ↓ Download TXT
+                    </button>
+                  </div>
                 </div>
-                <div style={S.cardBody}>
-                  {r.text.length > 600 ? r.text.slice(0, 600) + "\n…" : r.text}
-                </div>
+                <textarea
+                  style={S.previewTextarea}
+                  value={results[selectedResultIndex].text}
+                  onChange={(e) => {
+                    const newText = e.target.value;
+                    setResults((prev) =>
+                      prev.map((r, idx) =>
+                        idx === selectedResultIndex ? { ...r, text: newText } : r
+                      )
+                    );
+                  }}
+                  placeholder="No text extracted"
+                />
               </div>
-            ))}
+            )}
           </div>
         )}
       </main>
@@ -366,6 +448,9 @@ export default function OCRTool({ onBack }) {
         Powered by Tesseract.js (open-source OCR) · Supports मराठी, हिंदी, English ·
         100% free · No data stored · No API key needed
       </footer>
+
+      {/* ─── Buy Me a Coffee Popup ─── */}
+      {showCoffeeModal && <QRModal onClose={() => setShowCoffeeModal(false)} />}
     </div>
   );
 }
@@ -378,7 +463,7 @@ const S = {
   logoGlyph: { fontSize: 28, background: "linear-gradient(135deg,#FF6B35,#FF9F1C)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent", fontWeight: 800 },
   logoTitle: { fontSize: 18, fontWeight: 700, color: "#F0EBE0" },
   freeBadge: { background: "linear-gradient(135deg,#4CAF7D,#2D9B6B)", color: "#fff", padding: "5px 12px", borderRadius: 99, fontSize: 11, fontWeight: 800, letterSpacing: "0.5px" },
-  main: { flex: 1, padding: "32px 28px", maxWidth: 760, margin: "0 auto", width: "100%", boxSizing: "border-box" },
+  main: { flex: 1, padding: "32px 28px", maxWidth: 920, margin: "0 auto", width: "100%", boxSizing: "border-box" },
   loadingBanner: { background: "#1A1A10", border: "1px solid #3A3A10", color: "#C0B060", padding: "10px 16px", borderRadius: 8, fontSize: 13, marginBottom: 20 },
   langBox: { background: "#13131A", border: "1px solid #1E1E28", borderRadius: 14, padding: "18px 20px", marginBottom: 28 },
   langLabel: { fontSize: 13, fontWeight: 600, color: "#A8A0B0", marginBottom: 12 },
@@ -398,6 +483,8 @@ const S = {
   orText: { fontSize: 12, color: "#3A3848" },
   fileBtn: { display: "inline-block", background: "linear-gradient(135deg,#FF6B35,#FF9F1C)", color: "#fff", padding: "13px 32px", borderRadius: 10, fontWeight: 700, fontSize: 15, cursor: "pointer" },
   errorBox: { marginTop: 20, background: "#1E0A0A", border: "1px solid #3A1515", color: "#FF7070", padding: "12px 18px", borderRadius: 10, fontSize: 13, width: "100%", boxSizing: "border-box" },
+  
+  // Progress/Status Styling
   progressCard: { background: "#13131A", border: "1px solid #1E1E28", borderRadius: 14, padding: "28px 24px" },
   progressTop: { display: "flex", justifyContent: "space-between", marginBottom: 12 },
   progressLabel: { fontWeight: 600, fontSize: 15, color: "#F0EBE0" },
@@ -405,11 +492,17 @@ const S = {
   bar: { height: 6, background: "#1E1E28", borderRadius: 99, overflow: "hidden", marginBottom: 10 },
   barFill: { height: "100%", background: "linear-gradient(90deg,#FF6B35,#FF9F1C)", borderRadius: 99, transition: "width .3s ease" },
   progressSub: { fontSize: 12, color: "#5A5868" },
-  miniCard: { display: "flex", gap: 10, alignItems: "center", padding: "8px 0", borderBottom: "1px solid #1A1A22" },
-  miniName: { fontSize: 12, color: "#7A7888", fontFamily: "monospace", flex: "0 0 auto", maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
-  miniBarWrap: { flex: 1, height: 4, background: "#1E1E28", borderRadius: 99, overflow: "hidden" },
-  miniBar: { height: "100%", background: "linear-gradient(90deg,#FF6B35,#FF9F1C)", borderRadius: 99, transition: "width .2s ease" },
-  miniPct: { fontSize: 11, color: "#FF9F1C", fontWeight: 600, minWidth: 68, textAlign: "right" },
+  
+  // Progress Grid (8 per row on desktop)
+  progressGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(92px, 1fr))", gap: 8, marginTop: 20, maxHeight: 300, overflowY: "auto", paddingRight: 4 },
+  miniCardGrid: { background: "#0A0A12", border: "1px solid #1E1E28", borderRadius: 10, padding: "12px 8px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center", minHeight: 90, transition: "all 0.2s" },
+  miniCardProcessing: { borderColor: "#FF9F1C", background: "rgba(255,159,28,0.03)" },
+  miniCardDone: { borderColor: "#4CAF7D", background: "rgba(76,175,125,0.03)" },
+  miniCardIcon: { fontSize: 20, marginBottom: 6 },
+  miniCardName: { fontSize: 11, color: "#A8A0B0", width: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "monospace" },
+  miniCardPct: { fontSize: 10, color: "#FF9F1C", fontWeight: "bold", marginTop: 4 },
+
+  // Summary Bar
   summaryBar: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, background: "#13131A", border: "1px solid #1E1E28", borderRadius: 12, padding: "14px 18px", marginBottom: 16 },
   summaryLeft: { display: "flex", gap: 10 },
   summaryRight: { display: "flex", gap: 8, flexWrap: "wrap" },
@@ -418,9 +511,23 @@ const S = {
   btnPrimary: { background: "linear-gradient(135deg,#FF6B35,#FF9F1C)", color: "#fff", border: "none", padding: "8px 16px", borderRadius: 8, fontSize: 13, fontWeight: 700, cursor: "pointer" },
   btnSec: { background: "#1E1E28", color: "#E8E4DC", border: "1px solid #2E2E3A", padding: "8px 16px", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer" },
   btnGhost: { background: "transparent", color: "#5A5868", border: "1px solid #2E2E3A", padding: "8px 14px", borderRadius: 8, fontSize: 13, cursor: "pointer" },
-  card: { background: "#13131A", border: "1px solid #1E1E28", borderRadius: 12, padding: "14px 16px", marginBottom: 12 },
-  cardHead: { display: "flex", gap: 10, alignItems: "center", marginBottom: 10 },
-  cardName: { fontSize: 12, color: "#7A7888", fontFamily: "monospace" },
-  cardBody: { fontSize: 14, lineHeight: 1.9, color: "#D8D4CC", background: "#09090E", padding: "12px 14px", borderRadius: 8, whiteSpace: "pre-wrap", fontFamily: "'Noto Sans Devanagari','Inter',sans-serif", border: "1px solid #18181F" },
+
+  // Results Grid (8 per row on desktop)
+  resultsGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(92px, 1fr))", gap: 8, marginBottom: 20, maxHeight: 220, overflowY: "auto", paddingRight: 4 },
+  resultCard: { background: "#13131A", border: "1px solid #1E1E28", borderRadius: 10, padding: "12px 8px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", cursor: "pointer", transition: "all .15s", width: "100%", color: "#E8E4DC", borderStyle: "solid" },
+  resultCardActive: { borderColor: "#FF9F1C", background: "rgba(255,159,28,0.05)" },
+  resultCardError: { borderColor: "#FF6B6B", background: "rgba(255,107,107,0.03)" },
+  rcIcon: { fontSize: 20, marginBottom: 6 },
+  rcName: { fontSize: 11, color: "#A8A0B0", width: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "monospace" },
+  rcStatus: { fontSize: 9, color: "#6B6D80", marginTop: 4, textTransform: "uppercase", fontWeight: 700 },
+
+  // Interactive Preview Textarea Panel
+  previewBox: { background: "#13131A", border: "1px solid #1E1E28", borderRadius: 12, padding: "18px 20px", display: "flex", flexDirection: "column", gap: 12, marginTop: 16 },
+  previewHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, borderBottom: "1px solid #1E1E28", paddingBottom: 12 },
+  previewTitle: { fontSize: 13, color: "#A8A0B0" },
+  previewActions: { display: "flex", gap: 8 },
+  previewBtn: { background: "#1E1E28", border: "1px solid #2E2E3A", color: "#E8E4DC", padding: "6px 12px", borderRadius: 6, fontSize: 12, cursor: "pointer", fontWeight: 600, display: "flex", alignItems: "center", gap: 4, transition: "all .15s" },
+  previewTextarea: { width: "100%", height: 320, background: "#09090E", border: "1px solid #18181F", borderRadius: 8, padding: "14px 16px", color: "#D8D4CC", fontSize: 14, lineHeight: 1.8, fontFamily: "'Noto Sans Devanagari','Inter',sans-serif", resize: "vertical", outline: "none" },
+
   footer: { textAlign: "center", padding: "16px", fontSize: 12, color: "#2E2E3A", borderTop: "1px solid #18181F" },
 };
