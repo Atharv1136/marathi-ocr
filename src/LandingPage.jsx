@@ -67,6 +67,7 @@ function QRModal({ onClose }) {
             src={qrImg}
             alt="Scan to support the developer via UPI or any payment app"
             style={M.qrImg}
+            loading="lazy"
             onError={(e) => {
               e.target.style.display = "none";
               e.target.nextSibling.style.display = "flex";
