@@ -3,7 +3,7 @@ Allow: /
 Disallow: /api/
 
 # Sitemaps
-Sitemap: https://marathi-ocr.netlify.app/sitemap.xml
+Sitemap: https://marathiocr.netlify.app/sitemap.xml
 
 # Crawl-delay
 Crawl-delay: 10
