@@ -1,0 +1,16 @@
+{
+  "name": "Marathi OCR Online - Free Image to Text Converter",
+  "short_name": "Marathi OCR",
+  "description": "Convert Marathi, Hindi and English images to editable text online for free. 100% private and browser-based.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#050510",
+  "theme_color": "#FF6B35",
+  "icons": [
+    {
+      "src": "/favicon.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
