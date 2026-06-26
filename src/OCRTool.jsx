@@ -194,6 +194,11 @@ export default function OCRTool({ onBack }) {
   const [selectedResultIndex, setSelectedResultIndex] = useState(0);
   const fileInputRef   = useRef(null);
   const objectUrlsRef  = useRef([]);
+  const isCancelledRef = useRef(false);
+
+  const stopProcessing = () => {
+    isCancelledRef.current = true;
+  };
 
   useEffect(() => {
     if (status === "done") {
@@ -227,6 +232,7 @@ export default function OCRTool({ onBack }) {
 
     setStatus("loading"); setResults([]); setErrorMsg("");
     setProgress({ current: 0, total: 0, imgPct: 0 });
+    isCancelledRef.current = false;
 
     try {
       await loadTesseract();
@@ -250,6 +256,9 @@ export default function OCRTool({ onBack }) {
       setProgress({ current: 0, total: images.length, imgPct: 0 });
 
       for (let i = 0; i < images.length; i++) {
+        if (isCancelledRef.current) {
+          break;
+        }
         const img = images[i];
         setProgress((p) => ({ ...p, current: i + 1, imgPct: 0 }));
         setResults((prev) => [...prev, { name: img.name, text: "", status: "processing", pct: 0 }]);
@@ -258,11 +267,21 @@ export default function OCRTool({ onBack }) {
             setResults((prev) => prev.map((r) => r.name === img.name ? { ...r, pct } : r));
             setProgress((p) => ({ ...p, imgPct: pct }));
           });
+          
+          if (isCancelledRef.current) {
+            break;
+          }
+          
           setResults((prev) => prev.map((r) => r.name === img.name ? { ...r, text, status: "done", pct: 100 } : r));
         } catch (e) {
           setResults((prev) => prev.map((r) => r.name === img.name ? { ...r, text: `[Error: ${e.message}]`, status: "error", pct: 0 } : r));
         }
       }
+
+      if (isCancelledRef.current) {
+        setResults((prev) => prev.filter((r) => r.status === "done" || r.status === "error"));
+      }
+
       setStatus("done");
     } catch (e) {
       setErrorMsg(e.message || "Failed to process the uploaded file.");
@@ -382,9 +401,12 @@ export default function OCRTool({ onBack }) {
             <div style={S.bar}>
               <div style={{ ...S.barFill, width: `${Math.min(overallPct, 99)}%` }} />
             </div>
-            <div style={S.progressSub}>
-              ✨ Enhanced mode: upscale → grayscale → contrast → sharpen → OCR &nbsp;·&nbsp;
-              {LANG_OPTIONS.find((o) => o.value === lang)?.label}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+              <span style={S.progressSub}>
+                ✨ Enhanced mode: upscale → grayscale → contrast → sharpen → OCR &nbsp;·&nbsp;
+                {LANG_OPTIONS.find((o) => o.value === lang)?.label}
+              </span>
+              <button style={S.stopBtn} onClick={stopProcessing}>🛑 Stop Processing</button>
             </div>
             
             {/* Progress Card Grid (8 per row on desktop) */}
@@ -554,12 +576,15 @@ const S = {
   
   // Progress Grid (8 per row on desktop)
   progressGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(92px, 1fr))", gap: 8, marginTop: 20, maxHeight: 300, overflowY: "auto", paddingRight: 4 },
-  miniCardGrid: { background: "#0A0A12", border: "1px solid #1E1E28", borderRadius: 10, padding: "12px 8px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center", minHeight: 90, transition: "all 0.2s" },
-  miniCardProcessing: { borderColor: "#FF9F1C", background: "rgba(255,159,28,0.03)" },
-  miniCardDone: { borderColor: "#4CAF7D", background: "rgba(76,175,125,0.03)" },
+  miniCardGrid: { background: "rgba(255, 255, 255, 0.02)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)", border: "1px solid rgba(255, 255, 255, 0.07)", borderRadius: 10, padding: "12px 8px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center", minHeight: 90, transition: "all 0.2s" },
+  miniCardProcessing: { borderColor: "rgba(255, 159, 28, 0.4)", background: "rgba(255, 159, 28, 0.06)" },
+  miniCardDone: { borderColor: "rgba(76, 175, 125, 0.4)", background: "rgba(76, 175, 125, 0.06)" },
   miniCardIcon: { fontSize: 20, marginBottom: 6 },
   miniCardName: { fontSize: 11, color: "#A8A0B0", width: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "monospace" },
   miniCardPct: { fontSize: 10, color: "#FF9F1C", fontWeight: "bold", marginTop: 4 },
+
+  // Stop Button
+  stopBtn: { background: "rgba(255, 107, 107, 0.12)", border: "1px solid rgba(255, 107, 107, 0.25)", color: "#FF7070", padding: "8px 16px", borderRadius: 8, fontSize: 12, fontWeight: 700, cursor: "pointer", transition: "all 0.15s" },
 
   // Summary Bar
   summaryBar: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, background: "#13131A", border: "1px solid #1E1E28", borderRadius: 12, padding: "14px 18px", marginBottom: 16 },
@@ -573,9 +598,9 @@ const S = {
 
   // Results Grid (8 per row on desktop)
   resultsGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(92px, 1fr))", gap: 8, marginBottom: 20, maxHeight: 220, overflowY: "auto", paddingRight: 4 },
-  resultCard: { background: "#13131A", border: "1px solid #1E1E28", borderRadius: 10, padding: "12px 8px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", cursor: "pointer", transition: "all .15s", width: "100%", color: "#E8E4DC", borderStyle: "solid" },
-  resultCardActive: { borderColor: "#FF9F1C", background: "rgba(255,159,28,0.05)" },
-  resultCardError: { borderColor: "#FF6B6B", background: "rgba(255,107,107,0.03)" },
+  resultCard: { background: "rgba(255, 255, 255, 0.02)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)", border: "1px solid rgba(255, 255, 255, 0.07)", borderRadius: 10, padding: "12px 8px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", cursor: "pointer", transition: "all .15s", width: "100%", color: "#E8E4DC", borderStyle: "solid" },
+  resultCardActive: { borderColor: "rgba(255, 159, 28, 0.5)", background: "rgba(255, 159, 28, 0.08)" },
+  resultCardError: { borderColor: "rgba(255, 107, 107, 0.4)", background: "rgba(255, 107, 107, 0.04)" },
   rcIcon: { fontSize: 20, marginBottom: 6 },
   rcName: { fontSize: 11, color: "#A8A0B0", width: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "monospace" },
   rcStatus: { fontSize: 9, color: "#6B6D80", marginTop: 4, textTransform: "uppercase", fontWeight: 700 },
