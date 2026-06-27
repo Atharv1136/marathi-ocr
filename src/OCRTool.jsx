@@ -63,12 +63,12 @@ async function extractImagesFromZip(zipFile) {
 
 // ─── Image Preprocessing Pipeline ───────────────────────────────────────────
 // Standard:     1) Upscale  →  2) Grayscale + Contrast  →  3) Unsharp masking
-// Handwriting:  1) Upscale  →  2) Gentle grayscale  →  3) Adaptive threshold
+// Handwriting:  1) Upscale  →  2) Grayscale  →  3) Denoise blur  →  4) Otsu threshold
 async function preprocessImage(objectUrl, isHandwriting = false) {
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
-      const MIN_DIM = isHandwriting ? 2800 : 2200;
+      const MIN_DIM = isHandwriting ? 2600 : 2200;
       const scale   = Math.max(1, Math.min(4, MIN_DIM / Math.max(img.width, img.height)));
       const w = Math.round(img.width  * scale);
       const h = Math.round(img.height * scale);
@@ -85,46 +85,51 @@ async function preprocessImage(objectUrl, isHandwriting = false) {
       const d         = imageData.data;
 
       if (isHandwriting) {
-        // ── Handwriting mode: gentler contrast + local adaptive binarization ──
-        const contrast  = 1.3, brightness = 5;
-        const lut       = new Uint8ClampedArray(256);
-        for (let i = 0; i < 256; i++)
-          lut[i] = Math.min(255, Math.max(0, Math.round((i - 128) * contrast + 128 + brightness)));
-
-        // Convert to grayscale with gentle contrast
+        // ── Step 1: Convert to grayscale (no contrast boost — keep ink gradients) ──
         for (let i = 0; i < d.length; i += 4) {
           const gray = Math.round(d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114);
-          d[i] = d[i + 1] = d[i + 2] = lut[gray];
+          d[i] = d[i + 1] = d[i + 2] = gray;
         }
         ctx.putImageData(imageData, 0, 0);
 
-        // Adaptive-threshold binarization: compare each pixel to its local mean
-        const src   = ctx.getImageData(0, 0, w, h);
-        const out   = ctx.createImageData(w, h);
-        const sd_   = src.data;
-        const od    = out.data;
-        const radius = Math.max(8, Math.round(w * 0.015)); // ~1.5% of width
-        const C      = 10; // constant subtracted from local mean
+        // ── Step 2: Slight Gaussian blur to reduce pen-stroke noise ──
+        const blurCanvas = document.createElement("canvas");
+        blurCanvas.width = w; blurCanvas.height = h;
+        const blurCtx = blurCanvas.getContext("2d");
+        blurCtx.filter = "blur(1px)";
+        blurCtx.drawImage(canvas, 0, 0);
 
-        for (let y = 0; y < h; y++) {
-          for (let x = 0; x < w; x++) {
-            // Compute local mean (box blur approx)
-            let sum = 0, count = 0;
-            for (let dy = -radius; dy <= radius; dy += 4) {
-              for (let dx = -radius; dx <= radius; dx += 4) {
-                const nx = Math.min(w - 1, Math.max(0, x + dx));
-                const ny = Math.min(h - 1, Math.max(0, y + dy));
-                sum  += sd_[(ny * w + nx) * 4];
-                count++;
-              }
-            }
-            const mean  = sum / count;
-            const idx   = (y * w + x) * 4;
-            const pixel = sd_[idx];
-            const val   = pixel < mean - C ? 0 : 255;
-            od[idx] = od[idx + 1] = od[idx + 2] = val;
-            od[idx + 3] = 255;
-          }
+        // ── Step 3: Otsu global threshold binarization ──
+        // Builds a histogram and finds the optimal global threshold
+        const blurData = blurCtx.getImageData(0, 0, w, h);
+        const bd = blurData.data;
+        const histogram = new Int32Array(256);
+        for (let i = 0; i < bd.length; i += 4) histogram[bd[i]]++;
+
+        const total = w * h;
+        let sum = 0;
+        for (let i = 0; i < 256; i++) sum += i * histogram[i];
+
+        let sumB = 0, wB = 0, maxVar = 0, threshold = 128;
+        for (let t = 0; t < 256; t++) {
+          wB += histogram[t];
+          if (wB === 0) continue;
+          const wF = total - wB;
+          if (wF === 0) break;
+          sumB += t * histogram[t];
+          const mB = sumB / wB;
+          const mF = (sum - sumB) / wF;
+          const between = wB * wF * (mB - mF) * (mB - mF);
+          if (between > maxVar) { maxVar = between; threshold = t; }
+        }
+
+        // Apply threshold: dark ink → black, background → white
+        const out = ctx.createImageData(w, h);
+        const od  = out.data;
+        for (let i = 0; i < bd.length; i += 4) {
+          const val = bd[i] < threshold ? 0 : 255;
+          od[i] = od[i + 1] = od[i + 2] = val;
+          od[i + 3] = 255;
         }
         ctx.putImageData(out, 0, 0);
       } else {
@@ -172,8 +177,9 @@ async function runOCROnImage(objectUrl, lang, onProgress, isHandwriting = false)
   const Tesseract   = window.Tesseract;
   const processedUrl = await preprocessImage(objectUrl, isHandwriting);
   try {
-    // Handwriting mode uses psm=7 (single line) or psm=6 (block) with no thresholding
-    const psmMode = isHandwriting ? "7" : "6";
+    // Handwriting: psm=6 (uniform block of text) — works for multi-line handwriting
+    // psm=7 (single line) was causing garbage; psm=6 is the safest for free-form text
+    const psmMode = isHandwriting ? "6" : "6";
     const result = await Tesseract.recognize(processedUrl, lang, {
       logger: (m) => {
         if (m.status === "recognizing text" && onProgress)
@@ -183,7 +189,7 @@ async function runOCROnImage(objectUrl, lang, onProgress, isHandwriting = false)
       tessedit_pageseg_mode:      psmMode,
       preserve_interword_spaces:  "1",
       tessedit_do_invert:         "0",
-      textord_heavy_nr:           isHandwriting ? "1" : "0",
+      textord_heavy_nr:           "0",
     });
     const text    = result.data.text?.trim() || "[No text found]";
     const cleaned = text
@@ -443,7 +449,7 @@ export default function OCRTool({ onBack }) {
           </div>
           {isHandwriting && (
             <div style={S.handwritingNote}>
-              ✍️ Handwriting mode: uses adaptive binarization &amp; enhanced upscaling for best results on handwritten English text
+              ✍️ Handwriting mode: grayscale → denoise → Otsu threshold → OCR. Works best on clear, high-contrast handwriting on white paper. Cursive/overlapping letters may still cause errors — Tesseract is primarily a print OCR engine.
             </div>
           )}
           <div style={S.privacyNote}>
