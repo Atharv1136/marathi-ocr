@@ -4,12 +4,25 @@ import { QRModal } from "./LandingPage";
 
 // ─── Language options ────────────────────────────────────────────────────────
 const LANG_OPTIONS = [
-  { value: "mar",         label: "मराठी (Marathi)" },
-  { value: "mar+hin",     label: "मराठी + हिंदी" },
-  { value: "mar+eng",     label: "मराठी + English" },
-  { value: "mar+hin+eng", label: "मराठी + हिंदी + English" },
-  { value: "hin",         label: "हिंदी (Hindi)" },
+  { value: "mar",         label: "मराठी (Marathi)",         handwriting: false },
+  { value: "mar+hin",     label: "मराठी + हिंदी",           handwriting: false },
+  { value: "mar+eng",     label: "मराठी + English",         handwriting: false },
+  { value: "mar+hin+eng", label: "मराठी + हिंदी + English", handwriting: false },
+  { value: "hin",         label: "हिंदी (Hindi)",           handwriting: false },
+  { value: "eng",         label: "English (Print)",         handwriting: false },
+  { value: "eng",         label: "English Handwriting ✍️",  handwriting: true,  id: "eng-handwriting" },
 ];
+
+// ─── useIsMobile hook ────────────────────────────────────────────────────────
+function useIsMobile() {
+  const [isMobile, setIsMobile] = useState(() => window.innerWidth < 640);
+  useEffect(() => {
+    const handler = () => setIsMobile(window.innerWidth < 640);
+    window.addEventListener("resize", handler);
+    return () => window.removeEventListener("resize", handler);
+  }, []);
+  return isMobile;
+}
 
 // ─── Tesseract CDN loader ────────────────────────────────────────────────────
 async function loadTesseract() {
@@ -49,12 +62,13 @@ async function extractImagesFromZip(zipFile) {
 }
 
 // ─── Image Preprocessing Pipeline ───────────────────────────────────────────
-// 1) Upscale  →  2) Grayscale + Contrast  →  3) Unsharp masking
-async function preprocessImage(objectUrl) {
+// Standard:     1) Upscale  →  2) Grayscale + Contrast  →  3) Unsharp masking
+// Handwriting:  1) Upscale  →  2) Gentle grayscale  →  3) Adaptive threshold
+async function preprocessImage(objectUrl, isHandwriting = false) {
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
-      const MIN_DIM = 2200;
+      const MIN_DIM = isHandwriting ? 2800 : 2200;
       const scale   = Math.max(1, Math.min(4, MIN_DIM / Math.max(img.width, img.height)));
       const w = Math.round(img.width  * scale);
       const h = Math.round(img.height * scale);
@@ -67,38 +81,84 @@ async function preprocessImage(objectUrl) {
       ctx.imageSmoothingQuality = "high";
       ctx.drawImage(img, 0, 0, w, h);
 
-      // Grayscale + contrast LUT
       const imageData = ctx.getImageData(0, 0, w, h);
       const d         = imageData.data;
-      const contrast  = 1.6, brightness = 8;
-      const lut       = new Uint8ClampedArray(256);
-      for (let i = 0; i < 256; i++)
-        lut[i] = Math.min(255, Math.max(0, Math.round((i - 128) * contrast + 128 + brightness)));
 
-      for (let i = 0; i < d.length; i += 4) {
-        const gray    = Math.round(d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114);
-        const enhanced = lut[gray];
-        d[i] = d[i + 1] = d[i + 2] = enhanced;
-      }
-      ctx.putImageData(imageData, 0, 0);
+      if (isHandwriting) {
+        // ── Handwriting mode: gentler contrast + local adaptive binarization ──
+        const contrast  = 1.3, brightness = 5;
+        const lut       = new Uint8ClampedArray(256);
+        for (let i = 0; i < 256; i++)
+          lut[i] = Math.min(255, Math.max(0, Math.round((i - 128) * contrast + 128 + brightness)));
 
-      // Unsharp masking
-      const blurCanvas = document.createElement("canvas");
-      blurCanvas.width = w; blurCanvas.height = h;
-      const blurCtx = blurCanvas.getContext("2d");
-      blurCtx.filter = `blur(${Math.max(1, Math.round(scale * 0.8))}px)`;
-      blurCtx.drawImage(canvas, 0, 0);
-
-      const sharpData = ctx.getImageData(0, 0, w, h);
-      const blurData  = blurCtx.getImageData(0, 0, w, h);
-      const sd = sharpData.data, bd = blurData.data;
-      const amount = 1.4;
-      for (let i = 0; i < sd.length; i += 4)
-        for (let c = 0; c < 3; c++) {
-          const diff = sd[i + c] - bd[i + c];
-          sd[i + c]  = Math.min(255, Math.max(0, Math.round(sd[i + c] + amount * diff)));
+        // Convert to grayscale with gentle contrast
+        for (let i = 0; i < d.length; i += 4) {
+          const gray = Math.round(d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114);
+          d[i] = d[i + 1] = d[i + 2] = lut[gray];
         }
-      ctx.putImageData(sharpData, 0, 0);
+        ctx.putImageData(imageData, 0, 0);
+
+        // Adaptive-threshold binarization: compare each pixel to its local mean
+        const src   = ctx.getImageData(0, 0, w, h);
+        const out   = ctx.createImageData(w, h);
+        const sd_   = src.data;
+        const od    = out.data;
+        const radius = Math.max(8, Math.round(w * 0.015)); // ~1.5% of width
+        const C      = 10; // constant subtracted from local mean
+
+        for (let y = 0; y < h; y++) {
+          for (let x = 0; x < w; x++) {
+            // Compute local mean (box blur approx)
+            let sum = 0, count = 0;
+            for (let dy = -radius; dy <= radius; dy += 4) {
+              for (let dx = -radius; dx <= radius; dx += 4) {
+                const nx = Math.min(w - 1, Math.max(0, x + dx));
+                const ny = Math.min(h - 1, Math.max(0, y + dy));
+                sum  += sd_[(ny * w + nx) * 4];
+                count++;
+              }
+            }
+            const mean  = sum / count;
+            const idx   = (y * w + x) * 4;
+            const pixel = sd_[idx];
+            const val   = pixel < mean - C ? 0 : 255;
+            od[idx] = od[idx + 1] = od[idx + 2] = val;
+            od[idx + 3] = 255;
+          }
+        }
+        ctx.putImageData(out, 0, 0);
+      } else {
+        // ── Standard print mode ──
+        const contrast  = 1.6, brightness = 8;
+        const lut       = new Uint8ClampedArray(256);
+        for (let i = 0; i < 256; i++)
+          lut[i] = Math.min(255, Math.max(0, Math.round((i - 128) * contrast + 128 + brightness)));
+
+        for (let i = 0; i < d.length; i += 4) {
+          const gray    = Math.round(d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114);
+          const enhanced = lut[gray];
+          d[i] = d[i + 1] = d[i + 2] = enhanced;
+        }
+        ctx.putImageData(imageData, 0, 0);
+
+        // Unsharp masking
+        const blurCanvas = document.createElement("canvas");
+        blurCanvas.width = w; blurCanvas.height = h;
+        const blurCtx = blurCanvas.getContext("2d");
+        blurCtx.filter = `blur(${Math.max(1, Math.round(scale * 0.8))}px)`;
+        blurCtx.drawImage(canvas, 0, 0);
+
+        const sharpData = ctx.getImageData(0, 0, w, h);
+        const blurData  = blurCtx.getImageData(0, 0, w, h);
+        const sd = sharpData.data, bd = blurData.data;
+        const amount = 1.4;
+        for (let i = 0; i < sd.length; i += 4)
+          for (let c = 0; c < 3; c++) {
+            const diff = sd[i + c] - bd[i + c];
+            sd[i + c]  = Math.min(255, Math.max(0, Math.round(sd[i + c] + amount * diff)));
+          }
+        ctx.putImageData(sharpData, 0, 0);
+      }
 
       canvas.toBlob((blob) => resolve(URL.createObjectURL(blob)), "image/png");
     };
@@ -108,20 +168,22 @@ async function preprocessImage(objectUrl) {
 }
 
 // ─── OCR runner ──────────────────────────────────────────────────────────────
-async function runOCROnImage(objectUrl, lang, onProgress) {
+async function runOCROnImage(objectUrl, lang, onProgress, isHandwriting = false) {
   const Tesseract   = window.Tesseract;
-  const processedUrl = await preprocessImage(objectUrl);
+  const processedUrl = await preprocessImage(objectUrl, isHandwriting);
   try {
+    // Handwriting mode uses psm=7 (single line) or psm=6 (block) with no thresholding
+    const psmMode = isHandwriting ? "7" : "6";
     const result = await Tesseract.recognize(processedUrl, lang, {
       logger: (m) => {
         if (m.status === "recognizing text" && onProgress)
           onProgress(Math.round((m.progress || 0) * 100));
       },
     }, {
-      tessedit_pageseg_mode:      "6",
+      tessedit_pageseg_mode:      psmMode,
       preserve_interword_spaces:  "1",
       tessedit_do_invert:         "0",
-      textord_heavy_nr:           "0",
+      textord_heavy_nr:           isHandwriting ? "1" : "0",
     });
     const text    = result.data.text?.trim() || "[No text found]";
     const cleaned = text
@@ -184,6 +246,7 @@ async function extractImagesFromPdf(pdfFile) {
 // ════════════════════════════════════════════════════════════════════════════
 export default function OCRTool({ onBack }) {
   const [lang,         setLang]         = useState("mar+eng");
+  const [isHandwriting, setIsHandwriting] = useState(false);
   const [isDragging,   setIsDragging]   = useState(false);
   const [status,       setStatus]       = useState("idle");
   const [results,      setResults]      = useState([]);
@@ -195,6 +258,7 @@ export default function OCRTool({ onBack }) {
   const fileInputRef   = useRef(null);
   const objectUrlsRef  = useRef([]);
   const isCancelledRef = useRef(false);
+  const isMobile       = useIsMobile();
 
   const stopProcessing = () => {
     isCancelledRef.current = true;
@@ -266,7 +330,7 @@ export default function OCRTool({ onBack }) {
           const text = await runOCROnImage(img.objectUrl, lang, (pct) => {
             setResults((prev) => prev.map((r) => r.name === img.name ? { ...r, pct } : r));
             setProgress((p) => ({ ...p, imgPct: pct }));
-          });
+          }, isHandwriting);
           
           if (isCancelledRef.current) {
             break;
@@ -353,16 +417,35 @@ export default function OCRTool({ onBack }) {
         <div style={S.langBox}>
           <div style={S.langLabel}>🌐 Select OCR Language</div>
           <div style={S.langGrid}>
-            {LANG_OPTIONS.map((opt) => (
-              <button
-                key={opt.value}
-                style={{ ...S.langBtn, ...(lang === opt.value ? S.langBtnActive : {}) }}
-                onClick={() => setLang(opt.value)}
-              >
-                {opt.label}
-              </button>
-            ))}
+            {LANG_OPTIONS.map((opt) => {
+              const optId = opt.id || opt.value;
+              const isActive = isHandwriting
+                ? opt.handwriting === true
+                : (opt.id !== "eng-handwriting" && lang === opt.value);
+              return (
+                <button
+                  key={optId}
+                  style={{ ...S.langBtn, ...(isActive ? S.langBtnActive : {}) }}
+                  onClick={() => {
+                    if (opt.handwriting) {
+                      setLang("eng");
+                      setIsHandwriting(true);
+                    } else {
+                      setLang(opt.value);
+                      setIsHandwriting(false);
+                    }
+                  }}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
           </div>
+          {isHandwriting && (
+            <div style={S.handwritingNote}>
+              ✍️ Handwriting mode: uses adaptive binarization &amp; enhanced upscaling for best results on handwritten English text
+            </div>
+          )}
           <div style={S.privacyNote}>
             🔒 All OCR processing runs 100% in your browser — no images are uploaded or stored anywhere
           </div>
@@ -403,8 +486,9 @@ export default function OCRTool({ onBack }) {
             </div>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
               <span style={S.progressSub}>
-                ✨ Enhanced mode: upscale → grayscale → contrast → sharpen → OCR &nbsp;·&nbsp;
-                {LANG_OPTIONS.find((o) => o.value === lang)?.label}
+                {isHandwriting ? "✍️ Handwriting mode: upscale → adaptive threshold → OCR" : "✨ Enhanced mode: upscale → grayscale → contrast → sharpen → OCR"}
+                &nbsp;·&nbsp;
+                {isHandwriting ? "English Handwriting" : LANG_OPTIONS.find((o) => o.value === lang && !o.handwriting)?.label}
               </span>
               <button style={S.stopBtn} onClick={stopProcessing}>🛑 Stop Processing</button>
             </div>
@@ -437,15 +521,15 @@ export default function OCRTool({ onBack }) {
         {/* Done */}
         {status === "done" && (
           <div>
-            <div style={S.summaryBar}>
+            <div style={{ ...S.summaryBar, flexDirection: isMobile ? "column" : "row", alignItems: isMobile ? "flex-start" : "center" }}>
               <div style={S.summaryLeft}>
                 <span style={S.pill}>✓ {successCount} extracted</span>
                 {errorCount > 0 && <span style={{ ...S.pill, ...S.pillRed }}>✗ {errorCount} failed</span>}
               </div>
-              <div style={S.summaryRight}>
-                <button style={S.btnPrimary} onClick={downloadCombined}>↓ Combined TXT</button>
-                <button style={S.btnSec}     onClick={downloadSeparate}>↓ Per-image TXTs</button>
-                <button style={S.btnGhost}   onClick={reset}>↺ New Upload</button>
+              <div style={{ ...S.summaryRight, width: isMobile ? "100%" : "auto" }}>
+                <button style={{ ...S.btnPrimary, flex: isMobile ? 1 : undefined }} onClick={downloadCombined}>↓ Combined TXT</button>
+                <button style={{ ...S.btnSec, flex: isMobile ? 1 : undefined }}     onClick={downloadSeparate}>↓ Per-image TXTs</button>
+                <button style={{ ...S.btnGhost, flex: isMobile ? 1 : undefined }}   onClick={reset}>↺ New Upload</button>
               </div>
             </div>
 
@@ -537,81 +621,87 @@ export default function OCRTool({ onBack }) {
 }
 
 const S = {
+  // ── Layout
   page: { minHeight: "100vh", background: "#0F0F13", color: "#E8E4DC", fontFamily: "'Inter','Segoe UI','Noto Sans Devanagari',system-ui,sans-serif", display: "flex", flexDirection: "column" },
-  nav: { padding: "16px 28px", borderBottom: "1px solid #1E1E28", display: "flex", alignItems: "center", gap: 14, background: "rgba(15,15,19,0.95)", backdropFilter: "blur(12px)", position: "sticky", top: 0, zIndex: 100 },
-  backBtn: { background: "transparent", border: "1px solid #2E2E3A", color: "#A0A0B0", padding: "7px 14px", borderRadius: 8, fontSize: 13, cursor: "pointer", transition: "all .15s" },
-  navLogo: { display: "flex", alignItems: "center", gap: 10, flex: 1, justifyContent: "center" },
-  logoGlyph: { fontSize: 28, background: "linear-gradient(135deg,#FF6B35,#FF9F1C)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent", fontWeight: 800 },
-  logoTitle: { fontSize: 18, fontWeight: 700, color: "#F0EBE0" },
-  freeBadge: { background: "linear-gradient(135deg,#4CAF7D,#2D9B6B)", color: "#fff", padding: "5px 12px", borderRadius: 99, fontSize: 11, fontWeight: 800, letterSpacing: "0.5px" },
-  main: { flex: 1, padding: "32px 28px", maxWidth: 920, margin: "0 auto", width: "100%", boxSizing: "border-box" },
+  nav: { padding: "12px 16px", borderBottom: "1px solid #1E1E28", display: "flex", alignItems: "center", gap: 10, background: "rgba(15,15,19,0.97)", backdropFilter: "blur(12px)", position: "sticky", top: 0, zIndex: 100 },
+  backBtn: { background: "transparent", border: "1px solid #2E2E3A", color: "#A0A0B0", padding: "7px 12px", borderRadius: 8, fontSize: 12, cursor: "pointer", transition: "all .15s", whiteSpace: "nowrap", flexShrink: 0 },
+  navLogo: { display: "flex", alignItems: "center", gap: 8, flex: 1, justifyContent: "center", minWidth: 0 },
+  logoGlyph: { fontSize: 24, background: "linear-gradient(135deg,#FF6B35,#FF9F1C)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent", fontWeight: 800, flexShrink: 0 },
+  logoTitle: { fontSize: 16, fontWeight: 700, color: "#F0EBE0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  freeBadge: { background: "linear-gradient(135deg,#4CAF7D,#2D9B6B)", color: "#fff", padding: "4px 10px", borderRadius: 99, fontSize: 10, fontWeight: 800, letterSpacing: "0.5px", flexShrink: 0 },
+  main: { flex: 1, padding: "20px 16px", maxWidth: 920, margin: "0 auto", width: "100%", boxSizing: "border-box" },
   loadingBanner: { background: "#1A1A10", border: "1px solid #3A3A10", color: "#C0B060", padding: "10px 16px", borderRadius: 8, fontSize: 13, marginBottom: 20 },
-  langBox: { background: "#13131A", border: "1px solid #1E1E28", borderRadius: 14, padding: "18px 20px", marginBottom: 28 },
-  langLabel: { fontSize: 13, fontWeight: 600, color: "#A8A0B0", marginBottom: 12 },
-  langGrid: { display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 12 },
-  langBtn: { background: "#0A0A12", border: "1px solid #2E2E3A", color: "#A8A0B0", padding: "8px 14px", borderRadius: 8, fontSize: 13, cursor: "pointer", fontFamily: "'Inter','Noto Sans Devanagari',sans-serif" },
+
+  // ── Language Selector
+  langBox: { background: "#13131A", border: "1px solid #1E1E28", borderRadius: 14, padding: "16px", marginBottom: 20 },
+  langLabel: { fontSize: 13, fontWeight: 600, color: "#A8A0B0", marginBottom: 10 },
+  langGrid: { display: "flex", flexWrap: "wrap", gap: 7, marginBottom: 10 },
+  langBtn: { background: "#0A0A12", border: "1px solid #2E2E3A", color: "#A8A0B0", padding: "8px 12px", borderRadius: 8, fontSize: 12, cursor: "pointer", fontFamily: "'Inter','Noto Sans Devanagari',sans-serif", lineHeight: 1.3 },
   langBtnActive: { background: "linear-gradient(135deg,#FF6B35,#FF9F1C)", border: "1px solid transparent", color: "#fff", fontWeight: 700 },
-  privacyNote: { fontSize: 12, color: "#4CAF7D", marginTop: 4 },
+  privacyNote: { fontSize: 11, color: "#4CAF7D", marginTop: 6 },
+  handwritingNote: { fontSize: 11, color: "#FF9F1C", marginTop: 6, marginBottom: 2, background: "rgba(255,159,28,0.06)", border: "1px solid rgba(255,159,28,0.2)", borderRadius: 8, padding: "8px 10px" },
+
+  // ── Upload
   uploadBox: { display: "flex", flexDirection: "column", alignItems: "center" },
-  dropzone: { width: "100%", boxSizing: "border-box", border: "2px dashed #2E2E3A", borderRadius: 14, padding: "52px 24px", textAlign: "center", background: "#13131A", transition: "all .2s" },
+  dropzone: { width: "100%", boxSizing: "border-box", border: "2px dashed #2E2E3A", borderRadius: 14, padding: "40px 16px", textAlign: "center", background: "#13131A", transition: "all .2s" },
   dropActive: { borderColor: "#FF6B35", background: "#1A1208" },
-  dropEmoji: { fontSize: 48, marginBottom: 14 },
-  dropTitle: { fontSize: 18, fontWeight: 600, color: "#F0EBE0", marginBottom: 6 },
-  dropSub: { fontSize: 13, color: "#5A5868" },
-  dropSub2: { fontSize: 12, color: "#3A3848", marginTop: 6 },
-  orRow: { display: "flex", alignItems: "center", gap: 12, margin: "20px 0", width: "100%" },
+  dropEmoji: { fontSize: 40, marginBottom: 12 },
+  dropTitle: { fontSize: 16, fontWeight: 600, color: "#F0EBE0", marginBottom: 6 },
+  dropSub: { fontSize: 12, color: "#5A5868" },
+  dropSub2: { fontSize: 11, color: "#3A3848", marginTop: 6 },
+  orRow: { display: "flex", alignItems: "center", gap: 12, margin: "16px 0", width: "100%" },
   orLine: { flex: 1, height: 1, background: "#1E1E28", display: "block" },
   orText: { fontSize: 12, color: "#3A3848" },
   fileBtn: { display: "inline-block", background: "linear-gradient(135deg,#FF6B35,#FF9F1C)", color: "#fff", padding: "13px 32px", borderRadius: 10, fontWeight: 700, fontSize: 15, cursor: "pointer" },
-  errorBox: { marginTop: 20, background: "#1E0A0A", border: "1px solid #3A1515", color: "#FF7070", padding: "12px 18px", borderRadius: 10, fontSize: 13, width: "100%", boxSizing: "border-box" },
-  
-  // Progress/Status Styling
-  progressCard: { background: "#13131A", border: "1px solid #1E1E28", borderRadius: 14, padding: "28px 24px" },
-  progressTop: { display: "flex", justifyContent: "space-between", marginBottom: 12 },
-  progressLabel: { fontWeight: 600, fontSize: 15, color: "#F0EBE0" },
-  progressPct: { fontWeight: 700, fontSize: 15, color: "#FF9F1C" },
+  errorBox: { marginTop: 16, background: "#1E0A0A", border: "1px solid #3A1515", color: "#FF7070", padding: "12px 16px", borderRadius: 10, fontSize: 12, width: "100%", boxSizing: "border-box" },
+
+  // ── Progress / Status
+  progressCard: { background: "#13131A", border: "1px solid #1E1E28", borderRadius: 14, padding: "20px 16px" },
+  progressTop: { display: "flex", justifyContent: "space-between", marginBottom: 12, gap: 8 },
+  progressLabel: { fontWeight: 600, fontSize: 14, color: "#F0EBE0" },
+  progressPct: { fontWeight: 700, fontSize: 14, color: "#FF9F1C", flexShrink: 0 },
   bar: { height: 6, background: "#1E1E28", borderRadius: 99, overflow: "hidden", marginBottom: 10 },
   barFill: { height: "100%", background: "linear-gradient(90deg,#FF6B35,#FF9F1C)", borderRadius: 99, transition: "width .3s ease" },
-  progressSub: { fontSize: 12, color: "#5A5868" },
-  
-  // Progress Grid (8 per row on desktop)
-  progressGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(92px, 1fr))", gap: 8, marginTop: 20, maxHeight: 300, overflowY: "auto", paddingRight: 4 },
-  miniCardGrid: { background: "rgba(255, 255, 255, 0.02)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)", border: "1px solid rgba(255, 255, 255, 0.07)", borderRadius: 10, padding: "12px 8px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center", minHeight: 90, transition: "all 0.2s" },
-  miniCardProcessing: { borderColor: "rgba(255, 159, 28, 0.4)", background: "rgba(255, 159, 28, 0.06)" },
-  miniCardDone: { borderColor: "rgba(76, 175, 125, 0.4)", background: "rgba(76, 175, 125, 0.06)" },
-  miniCardIcon: { fontSize: 20, marginBottom: 6 },
-  miniCardName: { fontSize: 11, color: "#A8A0B0", width: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "monospace" },
-  miniCardPct: { fontSize: 10, color: "#FF9F1C", fontWeight: "bold", marginTop: 4 },
+  progressSub: { fontSize: 11, color: "#5A5868" },
 
-  // Stop Button
-  stopBtn: { background: "rgba(255, 107, 107, 0.12)", border: "1px solid rgba(255, 107, 107, 0.25)", color: "#FF7070", padding: "8px 16px", borderRadius: 8, fontSize: 12, fontWeight: 700, cursor: "pointer", transition: "all 0.15s" },
+  // ── Progress Grid
+  progressGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(80px, 1fr))", gap: 6, marginTop: 16, maxHeight: 260, overflowY: "auto", paddingRight: 2 },
+  miniCardGrid: { background: "rgba(255,255,255,0.02)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 10, padding: "10px 6px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center", minHeight: 82, transition: "all 0.2s" },
+  miniCardProcessing: { borderColor: "rgba(255,159,28,0.4)", background: "rgba(255,159,28,0.06)" },
+  miniCardDone: { borderColor: "rgba(76,175,125,0.4)", background: "rgba(76,175,125,0.06)" },
+  miniCardIcon: { fontSize: 18, marginBottom: 5 },
+  miniCardName: { fontSize: 10, color: "#A8A0B0", width: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "monospace" },
+  miniCardPct: { fontSize: 10, color: "#FF9F1C", fontWeight: "bold", marginTop: 3 },
 
-  // Summary Bar
-  summaryBar: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, background: "#13131A", border: "1px solid #1E1E28", borderRadius: 12, padding: "14px 18px", marginBottom: 16 },
-  summaryLeft: { display: "flex", gap: 10 },
-  summaryRight: { display: "flex", gap: 8, flexWrap: "wrap" },
-  pill: { background: "#0D2A1A", color: "#4CAF7D", padding: "4px 12px", borderRadius: 99, fontSize: 13, fontWeight: 600 },
+  // ── Stop Button
+  stopBtn: { background: "rgba(255,107,107,0.12)", border: "1px solid rgba(255,107,107,0.25)", color: "#FF7070", padding: "7px 14px", borderRadius: 8, fontSize: 12, fontWeight: 700, cursor: "pointer", transition: "all 0.15s" },
+
+  // ── Summary Bar
+  summaryBar: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, background: "#13131A", border: "1px solid #1E1E28", borderRadius: 12, padding: "12px 16px", marginBottom: 14 },
+  summaryLeft: { display: "flex", gap: 8, flexWrap: "wrap" },
+  summaryRight: { display: "flex", gap: 6, flexWrap: "wrap" },
+  pill: { background: "#0D2A1A", color: "#4CAF7D", padding: "4px 10px", borderRadius: 99, fontSize: 12, fontWeight: 600 },
   pillRed: { background: "#2A0D0D", color: "#FF6B6B" },
-  btnPrimary: { background: "linear-gradient(135deg,#FF6B35,#FF9F1C)", color: "#fff", border: "none", padding: "8px 16px", borderRadius: 8, fontSize: 13, fontWeight: 700, cursor: "pointer" },
-  btnSec: { background: "#1E1E28", color: "#E8E4DC", border: "1px solid #2E2E3A", padding: "8px 16px", borderRadius: 8, fontSize: 13, fontWeight: 600, cursor: "pointer" },
-  btnGhost: { background: "transparent", color: "#5A5868", border: "1px solid #2E2E3A", padding: "8px 14px", borderRadius: 8, fontSize: 13, cursor: "pointer" },
+  btnPrimary: { background: "linear-gradient(135deg,#FF6B35,#FF9F1C)", color: "#fff", border: "none", padding: "8px 14px", borderRadius: 8, fontSize: 12, fontWeight: 700, cursor: "pointer", textAlign: "center" },
+  btnSec: { background: "#1E1E28", color: "#E8E4DC", border: "1px solid #2E2E3A", padding: "8px 14px", borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: "pointer", textAlign: "center" },
+  btnGhost: { background: "transparent", color: "#5A5868", border: "1px solid #2E2E3A", padding: "8px 12px", borderRadius: 8, fontSize: 12, cursor: "pointer", textAlign: "center" },
 
-  // Results Grid (8 per row on desktop)
-  resultsGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(92px, 1fr))", gap: 8, marginBottom: 20, maxHeight: 220, overflowY: "auto", paddingRight: 4 },
-  resultCard: { background: "rgba(255, 255, 255, 0.02)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)", border: "1px solid rgba(255, 255, 255, 0.07)", borderRadius: 10, padding: "12px 8px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", cursor: "pointer", transition: "all .15s", width: "100%", color: "#E8E4DC", borderStyle: "solid" },
-  resultCardActive: { borderColor: "rgba(255, 159, 28, 0.5)", background: "rgba(255, 159, 28, 0.08)" },
-  resultCardError: { borderColor: "rgba(255, 107, 107, 0.4)", background: "rgba(255, 107, 107, 0.04)" },
-  rcIcon: { fontSize: 20, marginBottom: 6 },
-  rcName: { fontSize: 11, color: "#A8A0B0", width: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "monospace" },
-  rcStatus: { fontSize: 9, color: "#6B6D80", marginTop: 4, textTransform: "uppercase", fontWeight: 700 },
+  // ── Results Grid
+  resultsGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(80px, 1fr))", gap: 6, marginBottom: 16, maxHeight: 200, overflowY: "auto", paddingRight: 2 },
+  resultCard: { background: "rgba(255,255,255,0.02)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 10, padding: "10px 6px", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", cursor: "pointer", transition: "all .15s", width: "100%", color: "#E8E4DC", borderStyle: "solid" },
+  resultCardActive: { borderColor: "rgba(255,159,28,0.5)", background: "rgba(255,159,28,0.08)" },
+  resultCardError: { borderColor: "rgba(255,107,107,0.4)", background: "rgba(255,107,107,0.04)" },
+  rcIcon: { fontSize: 18, marginBottom: 5 },
+  rcName: { fontSize: 10, color: "#A8A0B0", width: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: "monospace" },
+  rcStatus: { fontSize: 9, color: "#6B6D80", marginTop: 3, textTransform: "uppercase", fontWeight: 700 },
 
-  // Interactive Preview Textarea Panel
-  previewBox: { background: "#13131A", border: "1px solid #1E1E28", borderRadius: 12, padding: "18px 20px", display: "flex", flexDirection: "column", gap: 12, marginTop: 16 },
-  previewHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, borderBottom: "1px solid #1E1E28", paddingBottom: 12 },
-  previewTitle: { fontSize: 13, color: "#A8A0B0" },
-  previewActions: { display: "flex", gap: 8 },
-  previewBtn: { background: "#1E1E28", border: "1px solid #2E2E3A", color: "#E8E4DC", padding: "6px 12px", borderRadius: 6, fontSize: 12, cursor: "pointer", fontWeight: 600, display: "flex", alignItems: "center", gap: 4, transition: "all .15s" },
-  previewTextarea: { width: "100%", height: 320, background: "#09090E", border: "1px solid #18181F", borderRadius: 8, padding: "14px 16px", color: "#D8D4CC", fontSize: 14, lineHeight: 1.8, fontFamily: "'Noto Sans Devanagari','Inter',sans-serif", resize: "vertical", outline: "none" },
+  // ── Preview Panel
+  previewBox: { background: "#13131A", border: "1px solid #1E1E28", borderRadius: 12, padding: "16px", display: "flex", flexDirection: "column", gap: 10, marginTop: 14 },
+  previewHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, borderBottom: "1px solid #1E1E28", paddingBottom: 10 },
+  previewTitle: { fontSize: 12, color: "#A8A0B0", overflow: "hidden", textOverflow: "ellipsis", minWidth: 0 },
+  previewActions: { display: "flex", gap: 6, flexShrink: 0 },
+  previewBtn: { background: "#1E1E28", border: "1px solid #2E2E3A", color: "#E8E4DC", padding: "6px 10px", borderRadius: 6, fontSize: 11, cursor: "pointer", fontWeight: 600, display: "flex", alignItems: "center", gap: 3, transition: "all .15s", whiteSpace: "nowrap" },
+  previewTextarea: { width: "100%", minHeight: 240, height: 300, background: "#09090E", border: "1px solid #18181F", borderRadius: 8, padding: "12px 14px", color: "#D8D4CC", fontSize: 14, lineHeight: 1.8, fontFamily: "'Noto Sans Devanagari','Inter',sans-serif", resize: "vertical", outline: "none", boxSizing: "border-box" },
 
-  footer: { textAlign: "center", padding: "16px", fontSize: 12, color: "#2E2E3A", borderTop: "1px solid #18181F" },
+  footer: { textAlign: "center", padding: "14px 16px", fontSize: 11, color: "#2E2E3A", borderTop: "1px solid #18181F" },
 };
