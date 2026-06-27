@@ -1,6 +1,33 @@
 // netlify/functions/vision-ocr.js
 // Proxies Google Cloud Vision API (DOCUMENT_TEXT_DETECTION) for handwriting OCR.
-// The API key is stored as the GOOGLE_VISION_API_KEY env variable in Netlify dashboard.
+// Uses Node's built-in https module — works on Node 14/16/18.
+// API key stored as GOOGLE_VISION_API_KEY env variable in Netlify dashboard.
+
+const https = require("https");
+
+function httpsPost(url, bodyObj) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify(bodyObj);
+    const parsed = new URL(url);
+    const options = {
+      hostname: parsed.hostname,
+      path: parsed.pathname + parsed.search,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    };
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => resolve({ status: res.statusCode, body: data }));
+    });
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
 
 exports.handler = async (event) => {
   const CORS = {
@@ -9,7 +36,6 @@ exports.handler = async (event) => {
     "Access-Control-Allow-Methods": "POST, OPTIONS",
   };
 
-  // Handle preflight
   if (event.httpMethod === "OPTIONS") {
     return { statusCode: 204, headers: CORS, body: "" };
   }
@@ -32,36 +58,32 @@ exports.handler = async (event) => {
     ({ imageBase64 } = JSON.parse(event.body));
     if (!imageBase64) throw new Error("Missing imageBase64");
   } catch (e) {
-    return { statusCode: 400, headers: CORS, body: JSON.stringify({ error: "Invalid request body." }) };
+    return { statusCode: 400, headers: CORS, body: JSON.stringify({ error: "Invalid request body: " + e.message }) };
   }
 
   try {
-    const visionRes = await fetch(
-      `https://vision.googleapis.com/v1/images:annotate?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          requests: [
-            {
-              image: { content: imageBase64 },
-              features: [{ type: "DOCUMENT_TEXT_DETECTION" }],
-            },
-          ],
-        }),
-      }
-    );
+    const url = `https://vision.googleapis.com/v1/images:annotate?key=${apiKey}`;
+    const payload = {
+      requests: [
+        {
+          image: { content: imageBase64 },
+          features: [{ type: "DOCUMENT_TEXT_DETECTION" }],
+        },
+      ],
+    };
 
-    if (!visionRes.ok) {
-      const errBody = await visionRes.text();
+    const { status, body } = await httpsPost(url, payload);
+    const data = JSON.parse(body);
+
+    if (status !== 200) {
+      const errMsg = data?.error?.message || body;
       return {
-        statusCode: visionRes.status,
+        statusCode: status,
         headers: CORS,
-        body: JSON.stringify({ error: `Vision API error: ${errBody}` }),
+        body: JSON.stringify({ error: `Vision API error (${status}): ${errMsg}` }),
       };
     }
 
-    const data = await visionRes.json();
     const text = data.responses?.[0]?.fullTextAnnotation?.text?.trim() || "";
 
     return {
@@ -73,7 +95,7 @@ exports.handler = async (event) => {
     return {
       statusCode: 500,
       headers: CORS,
-      body: JSON.stringify({ error: e.message || "Vision API call failed." }),
+      body: JSON.stringify({ error: "Function error: " + (e.message || String(e)) }),
     };
   }
 };
