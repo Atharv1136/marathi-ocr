@@ -172,21 +172,62 @@ async function preprocessImage(objectUrl, isHandwriting = false) {
   });
 }
 
+// ─── Google Vision API runner (handwriting) ───────────────────────────────────
+// Converts objectUrl → base64 → sends to Netlify proxy → returns text
+async function runGoogleVisionOCR(objectUrl, onProgress) {
+  onProgress?.(10);
+
+  // Fetch the blob from the object URL and convert to base64
+  const blob = await fetch(objectUrl).then((r) => r.blob());
+  const base64 = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload  = () => resolve(reader.result.split(",")[1]); // strip data:...;base64,
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+
+  onProgress?.(40);
+
+  const res = await fetch("/api/vision-ocr", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ imageBase64: base64 }),
+  });
+
+  onProgress?.(80);
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || "Google Vision API request failed");
+  }
+
+  const { text, error } = await res.json();
+  if (error) throw new Error(error);
+
+  onProgress?.(100);
+  return text
+    ?.split("\n").map((l) => l.trimEnd()).join("\n")
+    .replace(/\n{3,}/g, "\n\n") || "[No text found]";
+}
+
 // ─── OCR runner ──────────────────────────────────────────────────────────────
 async function runOCROnImage(objectUrl, lang, onProgress, isHandwriting = false) {
-  const Tesseract   = window.Tesseract;
-  const processedUrl = await preprocessImage(objectUrl, isHandwriting);
+  // ── Handwriting: use Google Cloud Vision API ──
+  if (isHandwriting) {
+    return runGoogleVisionOCR(objectUrl, onProgress);
+  }
+
+  // ── Print / Devanagari: use Tesseract ──
+  const Tesseract    = window.Tesseract;
+  const processedUrl = await preprocessImage(objectUrl, false);
   try {
-    // Handwriting: psm=6 (uniform block of text) — works for multi-line handwriting
-    // psm=7 (single line) was causing garbage; psm=6 is the safest for free-form text
-    const psmMode = isHandwriting ? "6" : "6";
     const result = await Tesseract.recognize(processedUrl, lang, {
       logger: (m) => {
         if (m.status === "recognizing text" && onProgress)
           onProgress(Math.round((m.progress || 0) * 100));
       },
     }, {
-      tessedit_pageseg_mode:      psmMode,
+      tessedit_pageseg_mode:      "6",
       preserve_interword_spaces:  "1",
       tessedit_do_invert:         "0",
       textord_heavy_nr:           "0",
@@ -198,6 +239,7 @@ async function runOCROnImage(objectUrl, lang, onProgress, isHandwriting = false)
     URL.revokeObjectURL(processedUrl);
     return cleaned;
   } catch (e) {
+
     URL.revokeObjectURL(processedUrl);
     throw e;
   }
@@ -449,7 +491,7 @@ export default function OCRTool({ onBack }) {
           </div>
           {isHandwriting && (
             <div style={S.handwritingNote}>
-              ✍️ Handwriting mode: grayscale → denoise → Otsu threshold → OCR. Works best on clear, high-contrast handwriting on white paper. Cursive/overlapping letters may still cause errors — Tesseract is primarily a print OCR engine.
+              🔍 Handwriting mode powered by <strong>Google Cloud Vision API</strong> — the same engine behind Google Lens. Requires <code>GOOGLE_VISION_API_KEY</code> set in Netlify environment variables. Works on printed &amp; handwritten English text.
             </div>
           )}
           <div style={S.privacyNote}>
