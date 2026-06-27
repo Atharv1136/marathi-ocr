@@ -295,6 +295,7 @@ async function extractImagesFromPdf(pdfFile) {
 export default function OCRTool({ onBack }) {
   const [lang,         setLang]         = useState("mar+eng");
   const [isHandwriting, setIsHandwriting] = useState(false);
+  const [visionStatus, setVisionStatus] = useState("unknown"); // 'unknown'|'checking'|'ok'|'error'
   const [isDragging,   setIsDragging]   = useState(false);
   const [status,       setStatus]       = useState("idle");
   const [results,      setResults]      = useState([]);
@@ -307,6 +308,28 @@ export default function OCRTool({ onBack }) {
   const objectUrlsRef  = useRef([]);
   const isCancelledRef = useRef(false);
   const isMobile       = useIsMobile();
+
+  // ── Check if Google Vision API is reachable ──
+  const checkVisionAPI = useCallback(async () => {
+    setVisionStatus("checking");
+    try {
+      // Send a minimal 1x1 transparent PNG to test the endpoint
+      const TINY_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQAABjE+ibYAAAAASUVORK5CYII=";
+      const res = await fetch("/api/vision-ocr", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageBase64: TINY_PNG }),
+      });
+      if (res.ok) {
+        setVisionStatus("ok");
+      } else {
+        const { error } = await res.json().catch(() => ({}));
+        setVisionStatus(error?.includes("not set") ? "unconfigured" : "error");
+      }
+    } catch {
+      setVisionStatus("error");
+    }
+  }, []);
 
   const stopProcessing = () => {
     isCancelledRef.current = true;
@@ -478,9 +501,11 @@ export default function OCRTool({ onBack }) {
                     if (opt.handwriting) {
                       setLang("eng");
                       setIsHandwriting(true);
+                      checkVisionAPI();
                     } else {
                       setLang(opt.value);
                       setIsHandwriting(false);
+                      setVisionStatus("unknown");
                     }
                   }}
                 >
@@ -491,7 +516,43 @@ export default function OCRTool({ onBack }) {
           </div>
           {isHandwriting && (
             <div style={S.handwritingNote}>
-              🔍 Handwriting mode powered by <strong>Google Cloud Vision API</strong> — the same engine behind Google Lens. Requires <code>GOOGLE_VISION_API_KEY</code> set in Netlify environment variables. Works on printed &amp; handwritten English text.
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+                <span>🔍 Powered by <strong>Google Cloud Vision API</strong> — same engine as Google Lens</span>
+                {/* Live status badge */}
+                <span style={{
+                  display: "inline-flex", alignItems: "center", gap: 5,
+                  padding: "3px 10px", borderRadius: 99, fontSize: 11, fontWeight: 700,
+                  background:
+                    visionStatus === "ok"           ? "rgba(76,175,125,0.15)" :
+                    visionStatus === "checking"     ? "rgba(255,159,28,0.12)" :
+                    visionStatus === "unconfigured" ? "rgba(255,107,53,0.12)" :
+                    visionStatus === "error"        ? "rgba(255,80,80,0.12)"  :
+                    "rgba(255,255,255,0.05)",
+                  border: "1px solid " + (
+                    visionStatus === "ok"           ? "rgba(76,175,125,0.4)"  :
+                    visionStatus === "checking"     ? "rgba(255,159,28,0.35)" :
+                    visionStatus === "unconfigured" ? "rgba(255,107,53,0.35)" :
+                    visionStatus === "error"        ? "rgba(255,80,80,0.35)"  :
+                    "rgba(255,255,255,0.08)"),
+                  color:
+                    visionStatus === "ok"           ? "#4CAF7D" :
+                    visionStatus === "checking"     ? "#FF9F1C" :
+                    visionStatus === "unconfigured" ? "#FF6B35" :
+                    visionStatus === "error"        ? "#FF5050" :
+                    "#6B6D80",
+                }}>
+                  {visionStatus === "ok"           && <><span style={{ width: 7, height: 7, borderRadius: "50%", background: "#4CAF7D", display: "inline-block" }} /> Connected</>}
+                  {visionStatus === "checking"     && <>⏳ Checking…</>}
+                  {visionStatus === "unconfigured" && <>⚠️ API key not set</>}
+                  {visionStatus === "error"        && <>❌ Connection error</>}
+                  {visionStatus === "unknown"      && <>— Not tested</>}
+                </span>
+              </div>
+              {visionStatus === "unconfigured" && (
+                <div style={{ marginTop: 6, fontSize: 10, color: "#FF6B35" }}>
+                  Set <code style={{ background: "rgba(255,107,53,0.15)", padding: "1px 5px", borderRadius: 4 }}>GOOGLE_VISION_API_KEY</code> in Netlify → Site config → Environment variables, then redeploy.
+                </div>
+              )}
             </div>
           )}
           <div style={S.privacyNote}>
